@@ -1,0 +1,495 @@
+---
+title: "Project"
+author: 
+date: "2024-03-30"
+output: html_document
+---
+**Group Members: Tamalika Murasing & Mayen Udoffia**
+
+```{r}
+# load the packages
+library(dplyr)
+library(ggplot2)
+library(clustMixType)
+library(fpc)
+library(tidyr)
+```
+
+```{r}
+# load the dataset
+dataset_read <- read.csv("C:/Users/Owner/Downloads/2020-Feb.csv")
+dataset <- dataset_read
+head(dataset)
+```
+
+```{r}
+# structure of the dataset
+str(dataset)
+```
+
+```{r}
+# summary statistics
+summary(dataset)
+length(unique(dataset$user_session))
+length(unique(dataset$event_type))
+length(unique(dataset$product_id))
+length(unique(dataset$brand))
+```
+# Preprocessing and EDA
+
+```{r}
+# Delete the duplicate values
+dataset<-distinct(dataset)
+
+# Missing value count for category_code
+sum(is.na(dataset$category_code) | dataset$category_code == "")
+# Missing value count for category_code
+sum(is.na(dataset$brand) | dataset$brand == "")
+
+# Set constant default value for brand and category, when it is empty.
+dataset$category_code[is.na(dataset$category_code) | dataset$category_code == ""] <- "unknown"
+dataset$brand[is.na(dataset$brand) | dataset$brand == ""] <- "unknown"
+
+# Invalid value (price < 0) count for price
+sum(dataset$price < 0)
+
+# Remove rows with negative price, as invalid entries.
+dataset <- dataset[dataset$price >= 0, ]
+
+summary(dataset)
+
+```
+
+### Data Transformation
+
+```{r}
+# Creating time-based features
+dataset$event_time <- as.POSIXct(dataset$event_time, format="%Y-%m-%d %H:%M:%S", tz="UTC")
+dataset$hour <- as.integer(format(dataset$event_time, "%H"))
+dataset$weekday <- as.integer(format(dataset$event_time, "%u"))
+head(dataset)
+```
+
+### Data Normalization
+
+```{r}
+# Normalizing numerical features: 'price'
+# features will higher value range has more influence on the most models. To
+# reduce the impact of higher range of price, we are normalizing the values for price
+# in the range [-1, 1]
+# Scale 'price' to have zero mean and unit variance
+dataset$price <- scale(dataset$price)
+head(dataset)
+```
+
+```{r}
+# Converting categorical variables to factor type
+dataset$event_type <- as.factor(dataset$event_type)
+dataset$category_code <- as.factor(dataset$category_code)
+dataset$brand <- as.factor(dataset$brand)
+dataset$user_session <- as.factor(dataset$user_session)
+```
+
+Sampling 50000 records at random.
+
+```{r}
+dataset <- dataset %>% sample_n(50000)
+str(dataset)
+```
+
+```{r}
+# Plot pie chart for percentage split by event
+dataset %>%
+  count(event_type) %>%
+  arrange(desc(n)) %>%
+  mutate(percent = n / sum(n) * 100)->event_type_percentage
+
+options(repr.plot.width = 8, repr.plot.height = 8)
+event_type_percentage%>%
+    ggplot(aes(x="",y=percent, fill= event_type, label=percent))+
+    geom_col() +
+  coord_polar(
+    theta = "y", 
+    start = 0
+  ) + 
+geom_text(aes(x=1.5 ,label = round(percent, 2)) , position = position_stack(vjust =0.8))+
+theme(legend.key.size = unit(1.5, 'cm'),legend.text = element_text(size=20))+
+  theme_void()
+
+```
+
+# Customer activity segmentation
+
+## Feature variable selection, and cluster size determination
+
+```{r}
+
+# Function to calculate TWSS (total within-cluster Sum of Squares) for a range of k values
+calculate_twss <- function(data, max_clusters) {
+  twss <- numeric(max_clusters)
+  for (k in 2:max_clusters) {
+    set.seed(123)  # Ensure reproducibility
+    kproto_model <- kproto(x = data, k = k, iter.max = 10, nstart = 5)
+    twss[k] <- kproto_model$tot.withinss
+  }
+  twss
+}
+
+# Select features for clustering
+# We are selecting event_type, category_code, brand, price, hour and weekday as the features 
+# as these variables are relevant to business decisions regarding resource allocation and
+# investments.
+
+features <- dataset[, c("event_type", "category_code", "brand", "price", "hour", "weekday")]
+
+# Calculate TWSS for a range of k values from 2 to 6
+twss_values <- calculate_twss(features, 10)
+
+# Plot TWSS to determine the elbow point
+plot(2:10, twss_values[2:10], type = "b", xlab = "Number of Clusters", ylab = "Total Within-Cluster Sum of Squares",
+     main = "Elbow Method for Determining Optimal k")
+
+
+```
+
+
+Based on the elbow method graph, k=5 is the optimal number of clusters.
+
+## Modeling Technique - Clustering
+
+Given the problem statement of finding meaningful and actionable segments of activity in e-commerce, we will use Clustering data mining technique. Kproto function (for clustering) is choosen because it effectively handle both categorical and numerical data and still be computationally effective.
+
+
+```{r}
+# Based on the plot, select an appropriate k
+selected_k <- 5  
+
+# Perform K-Prototypes clustering using the selected k
+set.seed(123)  
+final_kproto_result <- kproto(x = features, k = selected_k, iter.max = 10, nstart = 5)
+
+# Print clustering output
+print(final_kproto_result)
+
+```
+
+
+```{r}
+# Viewing cluster centroids
+print(final_kproto_result$cluster.centers)
+
+# Count of data points in each cluster
+print(table(final_kproto_result$cluster))
+
+```
+
+```{r}
+summary(final_kproto_result)
+```
+
+
+## Validation - Cluster profiling
+
+For profiling the identified clusters, we will evaluate each clusters based on the values corresponding to 
+each feature variable in the observation from each cluster, and identify patterns.
+
+```{r}
+
+# Extracting cluster assignments to the dataset
+dataset$cluster <- final_kproto_result$cluster
+
+```
+
+
+
+
+```{r}
+summarize_cluster <- function(data, feature) {
+  # Replace empty strings with "unknown" in the feature column
+  data <- data %>%
+    mutate(!!feature := if_else(.data[[feature]] == "", "unknown", .data[[feature]]))
+
+  # Perform summarization
+  summary <- data %>%
+    group_by(cluster, !!sym(feature)) %>%
+    summarise(Count = n(), .groups = 'drop') %>%
+    pivot_wider(names_from = !!sym(feature), values_from = Count, values_fill = list(Count = 0)) %>%
+    arrange(cluster)
+  
+  return(summary)
+}
+
+# Apply the function to 'brand', 'category_code', and 'event_type'
+brand_summary <- summarize_cluster(dataset, "brand")
+category_code_summary <- summarize_cluster(dataset, "category_code")
+event_type_summary <- summarize_cluster(dataset, "event_type")
+
+# Print structures again to see if names are preserved now
+str(brand_summary)
+str(category_code_summary)
+str(event_type_summary)
+```
+
+```{r}
+# Checking unique values in brand and category_code
+print(unique(dataset$brand))
+print(unique(dataset$category_code))
+
+```
+
+```{r}
+# To view all the data in the R console
+options(width = 200, dplyr.width = Inf)  # Adjust console width for better readability
+
+print(event_type_summary)
+print(category_code_summary)
+print(brand_summary)
+
+```
+
+
+```{r}
+str(brand_summary)
+str(category_code_summary)
+str(event_type_summary)
+```
+
+
+# Cluster profiles - Analysis
+
+### Cluster 1: "Consistent Browsers"
+- **Behavior**: This cluster shows moderate engagement across brands and categories, with a significant number of events in each category but a relatively lower conversion to purchases. They have a high number of 'remove from cart' activities, suggesting indecisiveness or price sensitivity.
+- **Key Characteristics**: They browse a lot (highest 'remove from cart' rates), but their conversion to purchase is low compared to their carting activity.
+
+### Cluster 2: "Active Shoppers"
+- **Behavior**: Exhibits the highest cart activity and has substantial interaction across various brands and categories. However, their purchase rates do not proportionately reflect their carting activity, suggesting possible issues at checkout or final conversion.
+- **Key Characteristics**: Very active in adding items to the cart and browsing but need an extra nudge towards finalizing purchases.
+
+### Cluster 3: "Exploratory Participants"
+- **Behavior**: This cluster has a notable number of views, suggesting they are active in exploring products. Their cart and purchase activities are moderate, indicating a balanced but less committed shopping behavior.
+- **Key Characteristics**: Engaged in product exploration with moderate purchasing activity, likely influenced by browsing different product categories.
+
+### Cluster 4: "Potential Converters"
+- **Behavior**: Similar to Cluster 3, this cluster shows a very high number of views, indicating intense browsing activity. However, they have a higher conversion rate compared to Cluster 3, suggesting that they might be more influenced by browsing and then pushed towards making purchases.
+- **Key Characteristics**: Highly engaged viewers who need targeted marketing to convert browsing into more consistent purchasing.
+
+### Cluster 5: "Window Shoppers"
+- **Behavior**: Dominated by the highest view numbers but almost no cart activity and moderate purchase behavior, indicating that many are looking but not necessarily intending to buy immediately.
+- **Key Characteristics**: Likely attracted by browsing or researching products without immediate intent to purchase; high potential for retargeting campaigns to convert interest into sales in the long term.
+
+### Strategic Recommendations:
+1. **Cluster 1 ("Consistent Browsers")**: Implement strategies to reduce cart abandonment, such as targeted discounts, reminders, or free shipping offers.
+2. **Cluster 2 ("Active Shoppers")**: Optimize the checkout process to convert high intent to high sales. Consider upselling or cross-selling techniques to maximize revenue per user.
+3. **Cluster 3 ("Exploratory Participants")**: Enhance content marketing to educate and engage them more deeply, potentially increasing their commitment to purchases.
+4. **Cluster 4 ("Potential Converters")**: Use personalized recommendations and loyalty programs to increase purchase frequency and customer retention.
+5. **Cluster 5 ("Window Shoppers")**: Focus on long-term engagement strategies, such as email newsletters or dynamic retargeting ads, to bring them back during sale periods or when new products are launched.
+
+# User Behavior Analysis
+
+## Data Preparation
+
+
+```{r}
+dataset <- dataset_read
+dataset$event_time <- as.POSIXct(dataset$event_time, format="%Y-%m-%d %H:%M:%OS", tz="UTC")
+
+session_data <- dataset %>%
+  arrange(user_id, user_session, event_time) %>%
+  group_by(user_id, user_session) %>%
+  summarise(session_start = min(event_time),
+            session_end = max(event_time),
+            session_duration = as.numeric(difftime(max(event_time), min(event_time), units="mins")),
+            .groups = 'drop')
+
+# Merge back to main dataset
+dataset <- merge(dataset, session_data, by=c("user_id", "user_session"))
+
+```
+
+
+## Analyze User Interaction Events
+
+```{r}
+# Aggregate data to find most common interaction per user
+user_behavior <- dataset %>%
+  group_by(user_id, category_code, brand, event_type) %>%
+  summarise(count = n(), .groups = 'drop') %>%
+  arrange(desc(count))
+
+# Calculate most viewed product and category per user
+most_viewed <- dataset %>%
+  filter(event_type == "view") %>%
+  group_by(user_id) %>%
+  summarise(
+    most_viewed_product = names(which.max(table(product_id))),
+    most_viewed_category = names(which.max(table(category_code))),
+    .groups = 'drop'
+  )
+
+```
+
+
+## Correlation Analysis
+
+```{r}
+# Analyze correlation between session duration and purchases
+purchase_data <- dataset %>%
+  filter(event_type == "purchase") %>%
+  group_by(user_session) %>%
+  summarise(total_purchases = n(),
+            average_session_duration = mean(session_duration),
+            .groups = 'drop')
+
+correlation_analysis <- cor(purchase_data$total_purchases, purchase_data$average_session_duration)
+correlation_analysis
+
+# Time of day analysis
+dataset$hour_of_day <- format(dataset$event_time, "%H")
+interaction_time_of_day <- dataset %>%
+  group_by(hour_of_day, event_type) %>%
+  summarise(count = n(), .groups = 'drop')
+
+```
+
+
+
+## Monitoring Metrics
+
+```{r}
+# Average views per product
+average_views <- dataset %>%
+  filter(event_type == "view") %>%
+  group_by(product_id) %>%
+  summarise(average_views = mean(n()), .groups = 'drop')
+
+# Overall most viewed product and category
+overall_most_viewed_product <- which.max(table(dataset$product_id))
+overall_most_viewed_category <- which.max(table(dataset$category_code))
+
+```
+
+
+## Visualization
+
+```{r}
+
+# Plotting session duration vs. purchase correlation
+ggplot(purchase_data, aes(x=average_session_duration, y=total_purchases)) +
+  geom_point() +
+  geom_smooth(method="lm") +
+  labs(title="Correlation between Session Duration and Purchases", x="Session Duration (mins)", y="Total Purchases")
+
+# Interaction time of day
+ggplot(interaction_time_of_day, aes(x=hour_of_day, y=count, fill=event_type)) +
+  geom_bar(stat="identity", position="dodge") +
+  labs(title="User Interactions by Time of Day", x="Hour of Day", y="Count of Interactions")
+```
+#### Correlation Analysis
+The correlation coefficient of 0.0580 suggests a very weak positive relationship between session duration and purchasing behavior. This indicates that longer sessions do not significantly correlate with an increase in purchases.
+
+**Recommendations:**
+- **Target Quick Decisions:** Since session length has minimal impact on purchase decisions, focus on efficiency in product presentation and ease of the purchasing process.
+- **Experiment with User Experience Adjustments:** Test changes in site layout or checkout processes that might convert short-term visits into purchases more effectively.
+
+
+#### Interaction by Hour
+Analysis of user interaction by hour shows that activity peaks during the late afternoon and evening hours, particularly from 4 PM to 8 PM. This period sees the highest cart and purchase activities, indicating prime shopping times.
+
+**Recommendations:**
+- **Timed Promotions:** Launch promotions or flash sales during these peak hours to maximize exposure and conversion rates.
+- **Resource Allocation:** Adjust support and infrastructure to handle increased traffic and customer service inquiries during these times.
+
+
+```{r}
+
+# Most viewed products overall
+top_products <- most_viewed %>%
+  group_by(most_viewed_product) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count))
+
+filtered_most_viewed <- most_viewed %>%
+  filter(most_viewed_category != "")
+
+# Most viewed categories overall
+top_categories <- filtered_most_viewed %>%
+  group_by(most_viewed_category) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count))
+
+
+```
+
+
+```{r}
+
+top_20_products <- top_products %>% 
+  arrange(desc(count)) %>% 
+  head(20)
+
+ggplot(top_20_products, aes(x=reorder(most_viewed_product, count), y=count)) +
+  geom_bar(stat="identity", fill="coral") +
+  labs(title="Top Viewed Products", x="Product ID", y="View Count") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+ggplot(top_categories, aes(x=reorder(most_viewed_category, count), y=count)) +
+  geom_bar(stat="identity", fill="lightblue") +
+  labs(title="Top Viewed Categories", x="Category", y="View Count") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+#### Most Viewed Products and Categories
+The top viewed products and categories indicate specific interests that captivate users' attention. For instance, products like 5808664 and 5809910 are extremely popular, as well as categories such as appliances and furniture.
+
+**Recommendations:**
+- **Stock and Promote Top Products/Categories:** Focus inventory and marketing efforts on these top-performing items and categories to capitalize on existing user interest.
+- **Cross-Promotions:** Use the popularity of these items to introduce related products or categories, enhancing the breadth of browsing and the potential for additional sales.
+
+
+```{r}
+# Calculate the 95th percentile of session durations
+cutoff_max <- quantile(session_data$session_duration, 0.90)
+cutoff_min <- quantile(session_data$session_duration, 0.10)
+
+# Filter out durations longer than the cutoff
+filtered_session_data <- session_data %>%
+  filter(session_duration <= cutoff_max) %>%
+    filter(session_duration >= cutoff_min)
+
+
+ggplot(filtered_session_data, aes(x=session_duration)) +
+  geom_histogram(bins=50, fill="blue", color="black") +
+  labs(title="Distribution of Session Durations (Without Outliers)",
+       x="Session Duration (minutes)",
+       y="Frequency") +
+  theme_minimal()
+
+
+```
+
+#### Session Duration Analysis
+The session duration histogram indicates that the distribution is heavily skewed to the right, with the majority of sessions lasting less than one minute. This suggests that a significant portion of users leave the website shortly after arriving or only stay long enough to view a few items.
+
+**Recommendations:**
+- **Enhance User Engagement:** Improve the website's initial engagement by optimizing landing pages, simplifying navigation, and prominently displaying attractive offers or popular products.
+- **Increase Session Length:** Implement strategies such as personalized content, interactive elements, and incentives for deeper exploration (e.g., discounts or special offers after browsing certain pages).
+
+**Market Basket Analysis**
+
+```{r}
+
+
+#transactions <- as(split(dataset$event_type, dataset$product_id), "transactions")
+
+# Generate the item frequency plot for the top 20 items
+#itemFrequencyPlot(transactions, topN = 20, type = "absolute", main = "Item Frequency")
+
+# Use the Apriori algorithm to generate association rules
+#rules <- apriori(transactions, parameter = list(supp = 0.7, conf = 0.8))
+
+# View the top 5 rules
+#inspect(head(rules, n = 5))
+
+```
+
